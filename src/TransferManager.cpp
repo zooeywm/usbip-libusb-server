@@ -1,8 +1,7 @@
-#include "TransferManager.h"
-
 #include "DebugStats.h"
 #include "Log.h"
 #include "NetUtil.h"
+#include "TransferManager.h"
 #include "UsbIpProtocol.h"
 
 #include <cstdint>
@@ -13,12 +12,15 @@ namespace {
 void log_and_count_ret_error(const UrbSubmit& urb, int32_t usbip_status) {
     record_ret_error(usbip_status);
 
-    LOGW("RET_SUBMIT error:"
-         << " seq=" << urb.seqnum
-         << " status=" << usbip_status
-         << " ep=" << urb.ep
-         << " dir=" << urb.direction
-         << " len=" << urb.transfer_buffer_length);
+    if (usbip_status == -19) {
+        LOGI("RET_SUBMIT device gone:" << " seq=" << urb.seqnum << " status=" << usbip_status
+                                       << " ep=" << urb.ep << " dir=" << urb.direction
+                                       << " len=" << urb.transfer_buffer_length);
+    } else {
+        LOGW("RET_SUBMIT error:" << " seq=" << urb.seqnum << " status=" << usbip_status
+                                 << " ep=" << urb.ep << " dir=" << urb.direction
+                                 << " len=" << urb.transfer_buffer_length);
+    }
 
     if ((g_stats.retError.load() % 20) == 0) {
         dump_stats("ret-error");
@@ -69,11 +71,8 @@ void urb_loop(int client_fd, libusb_device_handle* handle, UsbRuntimeInfo& rt) {
                 return;
             }
 
-            LOGT("SUBMIT:"
-                 << " seq=" << urb.seqnum
-                 << " dir=" << urb.direction
-                 << " ep=" << urb.ep
-                 << " len=" << urb.transfer_buffer_length);
+            LOGT("SUBMIT:" << " seq=" << urb.seqnum << " dir=" << urb.direction << " ep=" << urb.ep
+                           << " len=" << urb.transfer_buffer_length);
 
             std::vector<uint8_t> response;
 
@@ -84,13 +83,15 @@ void urb_loop(int client_fd, libusb_device_handle* handle, UsbRuntimeInfo& rt) {
                     int32_t usbip_status = libusb_to_usbip_status(rc);
                     log_and_count_ret_error(urb, usbip_status);
                     send_ret_submit(client_fd, urb.seqnum, usbip_status, 0, {});
+
+                    if (usbip_status == -19) {
+                        LOGI("device disconnected during control transfer, exit URB loop");
+                        dump_stats("device-disconnected-control");
+                        return;
+                    }
                 } else {
-                    send_ret_submit(
-                        client_fd,
-                        urb.seqnum,
-                        0,
-                        static_cast<uint32_t>(response.size()),
-                        response);
+                    send_ret_submit(client_fd, urb.seqnum, 0,
+                                    static_cast<uint32_t>(response.size()), response);
                 }
             } else {
                 int transferred = 0;
@@ -100,6 +101,12 @@ void urb_loop(int client_fd, libusb_device_handle* handle, UsbRuntimeInfo& rt) {
                     int32_t usbip_status = libusb_to_usbip_status(rc);
                     log_and_count_ret_error(urb, usbip_status);
                     send_ret_submit(client_fd, urb.seqnum, usbip_status, 0, {});
+
+                    if (usbip_status == -19) {
+                        LOGI("device disconnected during bulk transfer, exit URB loop");
+                        dump_stats("device-disconnected-bulk");
+                        return;
+                    }
                 } else {
                     uint32_t actual = 0;
                     if (urb.direction == usbip::DirIn) {
@@ -120,9 +127,8 @@ void urb_loop(int client_fd, libusb_device_handle* handle, UsbRuntimeInfo& rt) {
             uint32_t unlinkSeqnum = get_be32(header + 20);
             auto n = ++g_stats.unlinkReq;
 
-            LOGW("UNLINK request count=" << n
-                 << " seq=" << seqnum
-                 << " unlink_seq=" << unlinkSeqnum);
+            LOGW("UNLINK request count=" << n << " seq=" << seqnum
+                                         << " unlink_seq=" << unlinkSeqnum);
 
             /*
              * 当前实现使用同步 libusb_bulk_transfer。收到 UNLINK 时，目标 URB
