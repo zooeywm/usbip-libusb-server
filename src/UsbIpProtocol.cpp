@@ -121,3 +121,21 @@ bool send_ret_submit(
     out.insert(out.end(), in_payload.begin(), in_payload.end());
     return write_exact(client_fd, out.data(), out.size());
 }
+
+bool send_ret_unlink(int client_fd, uint32_t seqnum, int32_t status) {
+    std::vector<uint8_t> out;
+
+    put_u32(out, usbip::RetUnlink);
+    put_u32(out, seqnum);
+    put_u32(out, 0);
+    put_u32(out, 0);
+    put_u32(out, 0);
+
+    put_u32(out, static_cast<uint32_t>(status));
+
+    for (int i = 0; i < 24; ++i) {
+        put_u8(out, 0);
+    }
+
+    return write_exact(client_fd, out.data(), out.size());
+}

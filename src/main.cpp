@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
     }
 
     if (argc >= 3) {
-        g_log_level = std::atoi(argv[2]);
+        logx::g_log_level = std::atoi(argv[2]);
     }
 
     libusb_context* usb_ctx = nullptr;

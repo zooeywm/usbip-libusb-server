@@ -79,3 +79,5 @@ bool send_ret_submit(
     int32_t status,
     uint32_t actual_length,
     const std::vector<uint8_t>& in_payload);
+
+bool send_ret_unlink(int client_fd, uint32_t seqnum, int32_t status);

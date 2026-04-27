@@ -1,8 +1,11 @@
 #include "LibusbBackend.h"
 
+#include "DebugStats.h"
 #include "Log.h"
 #include "NetUtil.h"
 
+#include <algorithm>
+#include <cstring>
 #include <iostream>
 
 uint32_t convert_speed(int speed) {
@@ -276,8 +279,10 @@ bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo
     return true;
 }
 
-void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt) {
-    LOGI("BOT reset recovery");
+void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt, const char* reason) {
+    auto n = ++g_stats.botRecovery;
+
+    LOGW("BOT reset recovery count=" << n << " reason=" << reason);
 
     int rc = libusb_control_transfer(
         handle,
@@ -289,10 +294,14 @@ void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt) 
         0,
         5000);
 
-    LOGI("BOT reset rc=" << rc);
+    LOGW("BOT reset rc=" << rc);
 
     libusb_clear_halt(handle, rt.bulkInEp);
     libusb_clear_halt(handle, rt.bulkOutEp);
+
+    if ((n % 20) == 0) {
+        dump_stats("bot-recovery");
+    }
 }
 
 int handle_control_submit(
@@ -309,10 +318,17 @@ int handle_control_submit(
     uint16_t wLength = static_cast<uint16_t>(urb.setup[6] | (urb.setup[7] << 8));
 
     if (bmRequestType == 0x00 && bRequest == 0x31) {
-        LOGT("usbip/vhci reset-like request ignored locally"
+        auto n = ++g_stats.req031;
+
+        LOGW("0x31 reset-like request count=" << n
              << " value=0x" << std::hex << wValue
              << " index=0x" << wIndex
              << std::dec);
+
+        if ((n % 50) == 0) {
+            dump_stats("0x31");
+        }
+
         return 0;
     }
 
@@ -321,11 +337,13 @@ int handle_control_submit(
 
         int rc = libusb_set_configuration(handle, static_cast<int>(wValue));
         if (rc != 0 && rc != LIBUSB_ERROR_BUSY) {
+            ++g_stats.controlError;
             LOGE("libusb_set_configuration failed: " << libusb_error_name(rc));
             return rc;
         }
 
         if (!reclaim_mass_storage_interface(handle, rt)) {
+            ++g_stats.controlError;
             return LIBUSB_ERROR_BUSY;
         }
 
@@ -358,6 +376,14 @@ int handle_control_submit(
          << " rc=" << rc);
 
     if (rc < 0) {
+        ++g_stats.controlError;
+        LOGE("control failed:"
+             << " bm=0x" << std::hex << static_cast<int>(bmRequestType)
+             << " req=0x" << static_cast<int>(bRequest)
+             << " value=0x" << wValue
+             << " index=0x" << wIndex
+             << std::dec
+             << " rc=" << rc << " " << libusb_error_name(rc));
         return rc;
     }
 
@@ -397,14 +423,17 @@ int handle_bulk_submit(
     int rc = libusb_bulk_transfer(handle, endpoint, data, length, &transferred, 15000);
 
     if (rc < 0) {
+        ++g_stats.bulkError;
+
         LOGE("bulk failed:"
              << " ep=0x" << std::hex << static_cast<int>(endpoint)
              << " rc=" << std::dec << rc
-             << " " << libusb_error_name(rc));
+             << " " << libusb_error_name(rc)
+             << " dir=" << urb.direction
+             << " len=" << length);
 
         if (rc == LIBUSB_ERROR_PIPE || rc == LIBUSB_ERROR_TIMEOUT) {
-            LOGI("bulk stalled/timeout, do BOT reset recovery");
-            bot_reset_recovery(handle, rt);
+            bot_reset_recovery(handle, rt, libusb_error_name(rc));
             response.clear();
             return rc;
         }
@@ -415,7 +444,7 @@ int handle_bulk_submit(
         return rc;
     }
 
-    if (urb.direction == usbip::DirOut && g_log_level >= LOG_TRACE) {
+    if (urb.direction == usbip::DirOut && ::logx::g_log_level >= ::logx::Trace) {
         dump_hex("bulk OUT payload", urb.out_payload);
     }
 

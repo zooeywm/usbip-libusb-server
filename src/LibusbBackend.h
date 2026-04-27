@@ -28,7 +28,7 @@ std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* ha
 bool claim_interface(libusb_device_handle* handle, int interfaceNumber);
 bool select_alt_setting(libusb_device_handle* handle, const UsbRuntimeInfo& rt);
 bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo& rt);
-void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt);
+void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt, const char* reason);
 
 int handle_control_submit(
     libusb_device_handle* handle,
