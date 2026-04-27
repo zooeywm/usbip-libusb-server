@@ -68,7 +68,7 @@ static constexpr uint32_t DirIn = 1;
 } // namespace usbip
 
 void append_usb_device(std::vector<uint8_t>& out, const UsbDeviceInfo& d);
-std::vector<uint8_t> build_devlist_reply(const std::optional<UsbDeviceInfo>& dev);
+std::vector<uint8_t> build_devlist_reply(const std::vector<UsbDeviceInfo>& devices);
 std::vector<uint8_t> build_import_reply_ok(const UsbDeviceInfo& d);
 std::vector<uint8_t> build_import_reply_error(uint32_t status);
 

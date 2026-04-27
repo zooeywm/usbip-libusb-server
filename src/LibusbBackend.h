@@ -21,7 +21,8 @@ struct UsbRuntimeInfo {
 
 uint32_t convert_speed(int speed);
 
-std::optional<UsbDeviceInfo> find_mass_storage_device(libusb_context* ctx);
+std::vector<UsbDeviceInfo> find_mass_storage_devices(libusb_context* ctx);
+std::optional<UsbDeviceInfo> find_mass_storage_device_by_busid(libusb_context* ctx, const std::string& busid);
 libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::string& busid);
 
 std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* handle);

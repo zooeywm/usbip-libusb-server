@@ -11,31 +11,43 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 namespace {
 
-std::atomic_bool g_device_busy {false};
+std::mutex g_busy_mutex;
+std::unordered_set<std::string> g_busy_busids;
 
 struct DeviceBusyGuard {
+    std::string busid;
     bool owns = false;
 
-    bool try_lock() {
-        bool expected = false;
-        owns = g_device_busy.compare_exchange_strong(expected, true);
-        return owns;
+    bool try_lock(std::string requested_busid) {
+        std::lock_guard<std::mutex> lock(g_busy_mutex);
+        if (g_busy_busids.contains(requested_busid)) {
+            return false;
+        }
+
+        busid = std::move(requested_busid);
+        g_busy_busids.insert(busid);
+        owns = true;
+        return true;
     }
 
     void release() {
-        if (owns) {
-            g_device_busy.store(false);
-            owns = false;
+        if (!owns) {
+            return;
         }
+
+        std::lock_guard<std::mutex> lock(g_busy_mutex);
+        g_busy_busids.erase(busid);
+        owns = false;
     }
 
     ~DeviceBusyGuard() {
@@ -67,18 +79,20 @@ void handle_client(int client_fd, libusb_context* usb_ctx) {
     }
 
     if (code == usbip::OpReqDevlist) {
-        auto dev = find_mass_storage_device(usb_ctx);
+        auto devices = find_mass_storage_devices(usb_ctx);
 
-        if (dev) {
-            LOGI("export device: busid=" << dev->busid
-                 << " vid=0x" << std::hex << dev->vid
-                 << " pid=0x" << dev->pid
-                 << std::dec);
-        } else {
+        if (devices.empty()) {
             LOGI("no mass storage device found");
+        } else {
+            for (const auto& dev : devices) {
+                LOGI("export device: busid=" << dev.busid
+                     << " vid=0x" << std::hex << dev.vid
+                     << " pid=0x" << dev.pid
+                     << std::dec);
+            }
         }
 
-        auto reply = build_devlist_reply(dev);
+        auto reply = build_devlist_reply(devices);
         write_exact(client_fd, reply.data(), reply.size());
         return;
     }
@@ -93,16 +107,16 @@ void handle_client(int client_fd, libusb_context* usb_ctx) {
         std::string req_busid = trim_c_string(busid_raw, sizeof(busid_raw));
         LOGI("import request busid=" << req_busid);
 
-        auto dev = find_mass_storage_device(usb_ctx);
-        if (!dev || dev->busid != req_busid) {
-            LOGE("requested device not found");
+        auto dev = find_mass_storage_device_by_busid(usb_ctx, req_busid);
+        if (!dev) {
+            LOGE("requested device not found: " << req_busid);
             auto reply = build_import_reply_error(1);
             write_exact(client_fd, reply.data(), reply.size());
             return;
         }
 
         DeviceBusyGuard busy_guard;
-        if (!busy_guard.try_lock()) {
+        if (!busy_guard.try_lock(req_busid)) {
             LOGW("device is busy, reject import busid=" << req_busid);
             auto reply = build_import_reply_error(1);
             write_exact(client_fd, reply.data(), reply.size());
@@ -159,7 +173,7 @@ void handle_client(int client_fd, libusb_context* usb_ctx) {
 #endif
         libusb_close(handle);
         busy_guard.release();
-        LOGI("import session ended, device released");
+        LOGI("import session ended, device released busid=" << req_busid);
         return;
     }
 

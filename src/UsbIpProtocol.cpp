@@ -24,25 +24,23 @@ void append_usb_device(std::vector<uint8_t>& out, const UsbDeviceInfo& d) {
     put_u8(out, static_cast<uint8_t>(d.interfaces.size()));
 }
 
-std::vector<uint8_t> build_devlist_reply(const std::optional<UsbDeviceInfo>& dev) {
+std::vector<uint8_t> build_devlist_reply(const std::vector<UsbDeviceInfo>& devices) {
     std::vector<uint8_t> out;
 
     put_u16(out, usbip::Version);
     put_u16(out, usbip::OpRepDevlist);
     put_u32(out, 0);
-    put_u32(out, dev ? 1 : 0);
+    put_u32(out, static_cast<uint32_t>(devices.size()));
 
-    if (!dev) {
-        return out;
-    }
+    for (const auto& dev : devices) {
+        append_usb_device(out, dev);
 
-    append_usb_device(out, *dev);
-
-    for (const auto& itf : dev->interfaces) {
-        put_u8(out, itf.cls);
-        put_u8(out, itf.subcls);
-        put_u8(out, itf.proto);
-        put_u8(out, 0);
+        for (const auto& itf : dev.interfaces) {
+            put_u8(out, itf.cls);
+            put_u8(out, itf.subcls);
+            put_u8(out, itf.proto);
+            put_u8(out, 0);
+        }
     }
 
     return out;

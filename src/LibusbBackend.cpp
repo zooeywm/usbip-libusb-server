@@ -6,168 +6,190 @@
 
 #include <algorithm>
 #include <cstring>
-#include <iostream>
-
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <stdexcept>
 
-static std::string read_sysfs_value(const std::filesystem::path& path)
-{
+uint32_t convert_speed(int speed) {
+    switch (speed) {
+    case LIBUSB_SPEED_LOW: return 1;
+    case LIBUSB_SPEED_FULL: return 2;
+    case LIBUSB_SPEED_HIGH: return 3;
+    case LIBUSB_SPEED_SUPER: return 5;
+    case LIBUSB_SPEED_SUPER_PLUS: return 6;
+    default: return 0;
+    }
+}
+
+namespace {
+
+std::string read_sysfs_value(const std::filesystem::path& path) {
     std::ifstream file(path);
     std::string value;
     file >> value;
     return value;
 }
 
-static std::string find_linux_sysfs_busid(uint8_t busnum, uint8_t devnum)
-{
+std::string fallback_busid(uint8_t busnum, uint8_t devnum) {
+    return std::to_string(static_cast<unsigned>(busnum)) + "-" +
+           std::to_string(static_cast<unsigned>(devnum));
+}
+
+std::string find_linux_sysfs_busid(uint8_t busnum, uint8_t devnum) {
+#ifdef __linux__
     const std::filesystem::path base = "/sys/bus/usb/devices";
 
-    for (const auto& entry : std::filesystem::directory_iterator(base)) {
-        if (!entry.is_directory()) {
+    std::error_code ec;
+    if (!std::filesystem::exists(base, ec)) {
+        return fallback_busid(busnum, devnum);
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
+        if (ec || !entry.is_directory()) {
             continue;
         }
 
-        const auto name = entry.path().filename().string();
+        const std::string name = entry.path().filename().string();
 
-        /*
-         * 过滤掉 usb6、6-0:1.0、6-1.3:1.0 这类不是设备本体的目录
-         */
-        if (name.rfind("usb", 0) == 0) {
-            continue;
-        }
-
-        if (name.find(":") != std::string::npos) {
+        // Skip root hubs and interface nodes. We only want device nodes such as 6-1.3.
+        if (name.rfind("usb", 0) == 0 || name.find(':') != std::string::npos) {
             continue;
         }
 
         const auto busnumPath = entry.path() / "busnum";
         const auto devnumPath = entry.path() / "devnum";
 
-        if (!std::filesystem::exists(busnumPath) || !std::filesystem::exists(devnumPath)) {
+        if (!std::filesystem::exists(busnumPath, ec) ||
+            !std::filesystem::exists(devnumPath, ec)) {
             continue;
         }
 
-        int sysBus = std::stoi(read_sysfs_value(busnumPath));
-        int sysDev = std::stoi(read_sysfs_value(devnumPath));
+        try {
+            int sysBus = std::stoi(read_sysfs_value(busnumPath));
+            int sysDev = std::stoi(read_sysfs_value(devnumPath));
 
-        if (sysBus == busnum && sysDev == devnum) {
-            return name;
+            if (sysBus == static_cast<int>(busnum) && sysDev == static_cast<int>(devnum)) {
+                return name;
+            }
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+#endif
+
+    return fallback_busid(busnum, devnum);
+}
+
+bool append_mass_storage_device_info(libusb_device* dev, UsbDeviceInfo& info) {
+    libusb_device_descriptor dd{};
+    if (libusb_get_device_descriptor(dev, &dd) != 0) {
+        return false;
+    }
+
+    libusb_config_descriptor* cfg = nullptr;
+    if (libusb_get_active_config_descriptor(dev, &cfg) != 0) {
+        if (libusb_get_config_descriptor(dev, 0, &cfg) != 0) {
+            return false;
         }
     }
 
-    /*
-     * fallback，避免极端环境没有 sysfs 时完全不可用
-     */
-    return std::to_string(busnum) + "-" + std::to_string(devnum);
-}
+    bool isMassStorage = false;
+    std::vector<UsbInterfaceInfo> ifaces;
 
-uint32_t convert_speed(int speed)
-{
-    switch (speed) {
-    case LIBUSB_SPEED_LOW:
-        return 1;
-    case LIBUSB_SPEED_FULL:
-        return 2;
-    case LIBUSB_SPEED_HIGH:
-        return 3;
-    case LIBUSB_SPEED_SUPER:
-        return 5;
-    case LIBUSB_SPEED_SUPER_PLUS:
-        return 6;
-    default:
-        return 0;
-    }
-}
-
-std::optional<UsbDeviceInfo> find_mass_storage_device(libusb_context* ctx)
-{
-    libusb_device** list = nullptr;
-    ssize_t count = libusb_get_device_list(ctx, &list);
-    if (count < 0) {
-        return std::nullopt;
-    }
-
-    std::optional<UsbDeviceInfo> result;
-
-    for (ssize_t i = 0; i < count && !result; ++i) {
-        libusb_device* dev = list[i];
-
-        libusb_device_descriptor dd{};
-        if (libusb_get_device_descriptor(dev, &dd) != 0) {
+    for (uint8_t j = 0; j < cfg->bNumInterfaces; ++j) {
+        const libusb_interface& intf = cfg->interface[j];
+        if (intf.num_altsetting <= 0) {
             continue;
         }
 
-        libusb_config_descriptor* cfg = nullptr;
-        if (libusb_get_active_config_descriptor(dev, &cfg) != 0) {
-            if (libusb_get_config_descriptor(dev, 0, &cfg) != 0) {
-                continue;
-            }
-        }
+        // Prefer reporting the first alternate setting here; runtime selection still
+        // chooses BOT protocol 0x50 later when the device is imported.
+        const libusb_interface_descriptor& alt = intf.altsetting[0];
 
-        bool isMassStorage = false;
-        std::vector<UsbInterfaceInfo> ifaces;
+        UsbInterfaceInfo ii;
+        ii.cls = alt.bInterfaceClass;
+        ii.subcls = alt.bInterfaceSubClass;
+        ii.proto = alt.bInterfaceProtocol;
+        ifaces.push_back(ii);
 
-        for (uint8_t j = 0; j < cfg->bNumInterfaces; ++j) {
-            const libusb_interface& intf = cfg->interface[j];
-            if (intf.num_altsetting <= 0) {
-                continue;
-            }
-
-            const libusb_interface_descriptor& alt = intf.altsetting[0];
-
-            UsbInterfaceInfo ii;
-            ii.cls = alt.bInterfaceClass;
-            ii.subcls = alt.bInterfaceSubClass;
-            ii.proto = alt.bInterfaceProtocol;
-            ifaces.push_back(ii);
-
-            if (ii.cls == 0x08) {
+        for (int k = 0; k < intf.num_altsetting; ++k) {
+            if (intf.altsetting[k].bInterfaceClass == 0x08) {
                 isMassStorage = true;
             }
         }
+    }
 
-        if (!isMassStorage) {
-            libusb_free_config_descriptor(cfg);
-            continue;
-        }
+    if (!isMassStorage) {
+        libusb_free_config_descriptor(cfg);
+        return false;
+    }
 
-        UsbDeviceInfo info;
-        info.busnum = libusb_get_bus_number(dev);
-        info.devnum = libusb_get_device_address(dev);
-        info.speed = convert_speed(libusb_get_device_speed(dev));
+    info.busnum = libusb_get_bus_number(dev);
+    info.devnum = libusb_get_device_address(dev);
+    info.speed = convert_speed(libusb_get_device_speed(dev));
 
-        info.vid = dd.idVendor;
-        info.pid = dd.idProduct;
-        info.bcdDevice = dd.bcdDevice;
+    info.vid = dd.idVendor;
+    info.pid = dd.idProduct;
+    info.bcdDevice = dd.bcdDevice;
 
-        info.devClass = dd.bDeviceClass;
-        info.devSubClass = dd.bDeviceSubClass;
-        info.devProtocol = dd.bDeviceProtocol;
-        info.numConfigurations = dd.bNumConfigurations;
-        info.configValue = cfg->bConfigurationValue;
-        info.interfaces = std::move(ifaces);
+    info.devClass = dd.bDeviceClass;
+    info.devSubClass = dd.bDeviceSubClass;
+    info.devProtocol = dd.bDeviceProtocol;
+    info.numConfigurations = dd.bNumConfigurations;
+    info.configValue = cfg->bConfigurationValue;
+    info.interfaces = std::move(ifaces);
 
+    info.busid = find_linux_sysfs_busid(
+        static_cast<uint8_t>(info.busnum),
+        static_cast<uint8_t>(info.devnum));
 #ifdef __linux__
-        info.busid = find_linux_sysfs_busid(
-            static_cast<uint8_t>(info.busnum),
-            static_cast<uint8_t>(info.devnum));
+    info.path = "/sys/bus/usb/devices/" + info.busid;
 #else
-        info.busid = std::to_string(info.busnum) + "-" + std::to_string(info.devnum);
+    info.path = "/usbip-libusb/" + info.busid;
 #endif
 
-        info.path = "/sys/bus/usb/devices/" + info.busid;
+    libusb_free_config_descriptor(cfg);
+    return true;
+}
 
-        result = info;
-        libusb_free_config_descriptor(cfg);
+} // namespace
+
+std::vector<UsbDeviceInfo> find_mass_storage_devices(libusb_context* ctx) {
+    libusb_device** list = nullptr;
+    ssize_t count = libusb_get_device_list(ctx, &list);
+    if (count < 0) {
+        return {};
+    }
+
+    std::vector<UsbDeviceInfo> devices;
+
+    for (ssize_t i = 0; i < count; ++i) {
+        UsbDeviceInfo info;
+        if (append_mass_storage_device_info(list[i], info)) {
+            devices.push_back(std::move(info));
+        }
     }
 
     libusb_free_device_list(list, 1);
-    return result;
+    return devices;
 }
 
-libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::string& busid)
+std::optional<UsbDeviceInfo> find_mass_storage_device_by_busid(
+    libusb_context* ctx,
+    const std::string& busid)
 {
+    auto devices = find_mass_storage_devices(ctx);
+    for (auto& dev : devices) {
+        if (dev.busid == busid) {
+            return dev;
+        }
+    }
+
+    return std::nullopt;
+}
+
+libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::string& busid) {
     libusb_device** list = nullptr;
     ssize_t count = libusb_get_device_list(ctx, &list);
     if (count < 0) {
@@ -180,12 +202,7 @@ libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::strin
         libusb_device* dev = list[i];
         uint8_t busnum = libusb_get_bus_number(dev);
         uint8_t devnum = libusb_get_device_address(dev);
-
-#ifdef __linux__
         std::string cur = find_linux_sysfs_busid(busnum, devnum);
-#else
-        std::string cur = std::to_string(busnum) + "-" + std::to_string(devnum);
-#endif
 
         if (cur != busid) {
             continue;
@@ -193,10 +210,8 @@ libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::strin
 
         int rc = libusb_open(dev, &handle);
         if (rc != 0) {
-            LOGE("libusb_open failed:"
-                 << " busid=" << busid
-                 << " rc=" << rc
-                 << " " << libusb_error_name(rc));
+            LOGE("libusb_open failed: busid=" << busid
+                 << " rc=" << rc << " " << libusb_error_name(rc));
             handle = nullptr;
         }
         break;
@@ -206,8 +221,7 @@ libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::strin
     return handle;
 }
 
-std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* handle)
-{
+std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* handle) {
     libusb_device* dev = libusb_get_device(handle);
 
     libusb_config_descriptor* cfg = nullptr;
@@ -277,18 +291,14 @@ std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* ha
     return bot ? bot : fallback;
 }
 
-bool claim_interface(libusb_device_handle* handle, int interfaceNumber)
-{
+bool claim_interface(libusb_device_handle* handle, int interfaceNumber) {
 #ifdef __linux__
-    int active = libusb_kernel_driver_active(handle, interfaceNumber);
-    if (active == 1) {
+    if (libusb_kernel_driver_active(handle, interfaceNumber) == 1) {
         int rc = libusb_detach_kernel_driver(handle, interfaceNumber);
         if (rc != 0) {
-            LOGE("libusb_detach_kernel_driver failed: "
-                 << libusb_error_name(rc));
+            LOGE("libusb_detach_kernel_driver failed: " << libusb_error_name(rc));
             return false;
         }
-
         LOGI("kernel driver detached from interface " << interfaceNumber);
     }
 #endif
@@ -303,8 +313,7 @@ bool claim_interface(libusb_device_handle* handle, int interfaceNumber)
     return true;
 }
 
-bool select_alt_setting(libusb_device_handle* handle, const UsbRuntimeInfo& rt)
-{
+bool select_alt_setting(libusb_device_handle* handle, const UsbRuntimeInfo& rt) {
     int rc = libusb_set_interface_alt_setting(handle, rt.interfaceNumber, rt.altSetting);
     if (rc != 0) {
         LOGE("libusb_set_interface_alt_setting failed: "
@@ -322,8 +331,7 @@ bool select_alt_setting(libusb_device_handle* handle, const UsbRuntimeInfo& rt)
     return true;
 }
 
-bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo& rt)
-{
+bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo& rt) {
     if (rt.interfaceNumber >= 0) {
         libusb_release_interface(handle, rt.interfaceNumber);
     }
@@ -359,15 +367,14 @@ bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo
     libusb_clear_halt(handle, rt.bulkOutEp);
 
     LOGI("reclaimed interface=" << rt.interfaceNumber
-                                << " bulkIn=0x" << std::hex << static_cast<int>(rt.bulkInEp)
-                                << " bulkOut=0x" << static_cast<int>(rt.bulkOutEp)
-                                << std::dec);
+         << " bulkIn=0x" << std::hex << static_cast<int>(rt.bulkInEp)
+         << " bulkOut=0x" << static_cast<int>(rt.bulkOutEp)
+         << std::dec);
 
     return true;
 }
 
-void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt, const char* reason)
-{
+void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt, const char* reason) {
     auto n = ++g_stats.botRecovery;
 
     LOGW("BOT reset recovery count=" << n << " reason=" << reason);
@@ -409,9 +416,9 @@ int handle_control_submit(
         auto n = ++g_stats.req031;
 
         LOGW("0x31 reset-like request count=" << n
-                                              << " value=0x" << std::hex << wValue
-                                              << " index=0x" << wIndex
-                                              << std::dec);
+             << " value=0x" << std::hex << wValue
+             << " index=0x" << wIndex
+             << std::dec);
 
         if ((n % 50) == 0) {
             dump_stats("0x31");
