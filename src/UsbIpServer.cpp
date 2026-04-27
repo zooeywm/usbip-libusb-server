@@ -11,10 +11,37 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace {
+
+std::atomic_bool g_device_busy {false};
+
+struct DeviceBusyGuard {
+    bool owns = false;
+
+    bool try_lock() {
+        bool expected = false;
+        owns = g_device_busy.compare_exchange_strong(expected, true);
+        return owns;
+    }
+
+    void release() {
+        if (owns) {
+            g_device_busy.store(false);
+            owns = false;
+        }
+    }
+
+    ~DeviceBusyGuard() {
+        release();
+    }
+};
 
 struct OpHeader {
     uint16_t version;
@@ -74,6 +101,14 @@ void handle_client(int client_fd, libusb_context* usb_ctx) {
             return;
         }
 
+        DeviceBusyGuard busy_guard;
+        if (!busy_guard.try_lock()) {
+            LOGW("device is busy, reject import busid=" << req_busid);
+            auto reply = build_import_reply_error(1);
+            write_exact(client_fd, reply.data(), reply.size());
+            return;
+        }
+
         auto reply = build_import_reply_ok(*dev);
         if (!write_exact(client_fd, reply.data(), reply.size())) {
             LOGE("failed to send import reply");
@@ -123,6 +158,8 @@ void handle_client(int client_fd, libusb_context* usb_ctx) {
         libusb_attach_kernel_driver(handle, rt->interfaceNumber);
 #endif
         libusb_close(handle);
+        busy_guard.release();
+        LOGI("import session ended, device released");
         return;
     }
 
@@ -167,8 +204,10 @@ void run_server(libusb_context* usb_ctx, int port) {
             continue;
         }
 
-        handle_client(client_fd, usb_ctx);
-        ::close(client_fd);
+        std::thread([client_fd, usb_ctx]() {
+            handle_client(client_fd, usb_ctx);
+            ::close(client_fd);
+        }).detach();
     }
 
     ::close(server_fd);

@@ -4,7 +4,63 @@
 #include "Log.h"
 #include "NetUtil.h"
 
+#include <algorithm>
+#include <cstring>
 #include <iostream>
+
+#include <filesystem>
+#include <fstream>
+
+static std::string read_sysfs_value(const std::filesystem::path& path)
+{
+    std::ifstream file(path);
+    std::string value;
+    file >> value;
+    return value;
+}
+
+static std::string find_linux_sysfs_busid(uint8_t busnum, uint8_t devnum)
+{
+    const std::filesystem::path base = "/sys/bus/usb/devices";
+
+    for (const auto& entry : std::filesystem::directory_iterator(base)) {
+        if (!entry.is_directory()) {
+            continue;
+        }
+
+        const auto name = entry.path().filename().string();
+
+        /*
+         * 过滤掉 usb6、6-0:1.0、6-1.3:1.0 这类不是设备本体的目录
+         */
+        if (name.rfind("usb", 0) == 0) {
+            continue;
+        }
+
+        if (name.find(":") != std::string::npos) {
+            continue;
+        }
+
+        const auto busnumPath = entry.path() / "busnum";
+        const auto devnumPath = entry.path() / "devnum";
+
+        if (!std::filesystem::exists(busnumPath) || !std::filesystem::exists(devnumPath)) {
+            continue;
+        }
+
+        int sysBus = std::stoi(read_sysfs_value(busnumPath));
+        int sysDev = std::stoi(read_sysfs_value(devnumPath));
+
+        if (sysBus == busnum && sysDev == devnum) {
+            return name;
+        }
+    }
+
+    /*
+     * fallback，避免极端环境没有 sysfs 时完全不可用
+     */
+    return std::to_string(busnum) + "-" + std::to_string(devnum);
+}
 
 uint32_t convert_speed(int speed)
 {
@@ -92,8 +148,15 @@ std::optional<UsbDeviceInfo> find_mass_storage_device(libusb_context* ctx)
         info.configValue = cfg->bConfigurationValue;
         info.interfaces = std::move(ifaces);
 
+#ifdef __linux__
+        info.busid = find_linux_sysfs_busid(
+            static_cast<uint8_t>(info.busnum),
+            static_cast<uint8_t>(info.devnum));
+#else
         info.busid = std::to_string(info.busnum) + "-" + std::to_string(info.devnum);
-        info.path = "/sys/devices/usbip-libusb/" + info.busid;
+#endif
+
+        info.path = "/sys/bus/usb/devices/" + info.busid;
 
         result = info;
         libusb_free_config_descriptor(cfg);
@@ -118,12 +181,22 @@ libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::strin
         uint8_t busnum = libusb_get_bus_number(dev);
         uint8_t devnum = libusb_get_device_address(dev);
 
+#ifdef __linux__
+        std::string cur = find_linux_sysfs_busid(busnum, devnum);
+#else
         std::string cur = std::to_string(busnum) + "-" + std::to_string(devnum);
+#endif
+
         if (cur != busid) {
             continue;
         }
 
-        if (libusb_open(dev, &handle) != 0) {
+        int rc = libusb_open(dev, &handle);
+        if (rc != 0) {
+            LOGE("libusb_open failed:"
+                 << " busid=" << busid
+                 << " rc=" << rc
+                 << " " << libusb_error_name(rc));
             handle = nullptr;
         }
         break;
@@ -207,12 +280,15 @@ std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* ha
 bool claim_interface(libusb_device_handle* handle, int interfaceNumber)
 {
 #ifdef __linux__
-    if (libusb_kernel_driver_active(handle, interfaceNumber) == 1) {
+    int active = libusb_kernel_driver_active(handle, interfaceNumber);
+    if (active == 1) {
         int rc = libusb_detach_kernel_driver(handle, interfaceNumber);
         if (rc != 0) {
-            LOGE("libusb_detach_kernel_driver failed: " << libusb_error_name(rc));
+            LOGE("libusb_detach_kernel_driver failed: "
+                 << libusb_error_name(rc));
             return false;
         }
+
         LOGI("kernel driver detached from interface " << interfaceNumber);
     }
 #endif
@@ -436,27 +512,20 @@ int handle_bulk_submit(
 
     if (rc < 0) {
         /*
-     * BOT CSW 是 13 字节 IN。
-     * 部分 U 盘会在 CSW 阶段 STALL bulk-in。
-     * 这里属于可恢复路径：clear halt 后重读 CSW。
-     */
+         * BOT CSW is a 13-byte IN transfer.
+         * Some devices STALL bulk-in before the CSW is read.
+         * This is recoverable: clear halt and retry CSW once.
+         */
         if (rc == LIBUSB_ERROR_PIPE && urb.direction == usbip::DirIn && length == 13) {
             static uint64_t cswPipeRecovered = 0;
 
             libusb_clear_halt(handle, endpoint);
 
             transferred = 0;
-            rc = libusb_bulk_transfer(
-                handle,
-                endpoint,
-                data,
-                length,
-                &transferred,
-                15000);
+            rc = libusb_bulk_transfer(handle, endpoint, data, length, &transferred, 15000);
 
             if (rc == 0) {
                 ++cswPipeRecovered;
-
                 if ((cswPipeRecovered % 100) == 0) {
                     LOGW("CSW pipe recovered count=" << cswPipeRecovered);
                 }
@@ -466,7 +535,6 @@ int handle_bulk_submit(
             }
 
             ++g_stats.bulkError;
-
             LOGE("CSW retry failed:"
                  << " ep=0x" << std::hex << static_cast<int>(endpoint)
                  << " rc=" << std::dec << rc
@@ -492,13 +560,7 @@ int handle_bulk_submit(
             libusb_clear_halt(handle, endpoint);
 
             transferred = 0;
-            rc = libusb_bulk_transfer(
-                handle,
-                endpoint,
-                data,
-                length,
-                &transferred,
-                15000);
+            rc = libusb_bulk_transfer(handle, endpoint, data, length, &transferred, 15000);
 
             LOGW("bulk retry:"
                  << " rc=" << rc
