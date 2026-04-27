@@ -131,9 +131,13 @@ void urb_loop(int client_fd, libusb_device_handle* handle, UsbRuntimeInfo& rt) {
                                          << " unlink_seq=" << unlinkSeqnum);
 
             /*
-             * 当前实现使用同步 libusb_bulk_transfer。收到 UNLINK 时，目标 URB
-             * 通常已经完成或无法取消。先返回 -ENOENT，表示没有找到可取消的
-             * pending URB。后续切换异步 libusb_transfer 时再实现真正 cancel。
+             * The current implementation uses synchronous libusb_bulk_transfer().
+             * When an UNLINK request is received, the target URB has typically already
+             * completed or cannot be canceled. Therefore, we return -ENOENT to indicate
+             * that no pending URB could be found for cancellation.
+             *
+             * Proper cancellation handling will be implemented later when switching
+             * to asynchronous libusb_transfer.
              */
             send_ret_unlink(client_fd, seqnum, -2);
 

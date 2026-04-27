@@ -1,50 +1,24 @@
 # usbip-libusb-server
 
-A minimal C++ USB/IP server prototype backed by libusb.
+A prototype USB/IP server implemented in userspace with libusb.
 
-Current target:
+Current status:
+- Linux USB Mass Storage / BOT path is the validated target.
+- Linux-specific device identity and kernel-driver detach/reattach logic is isolated in `PlatformUsbLinux.cpp`.
+- macOS scaffolding is isolated in `PlatformUsbDarwin.cpp`; it is a portability layer, not a guarantee that macOS can claim every USB storage device without additional entitlement / unmount handling.
 
-- Linux development host
-- Linux official usbip client / vhci-hcd
-- USB Mass Storage / BOT flash drive
-
-## Build
+Build:
 
 ```bash
 cmake -S . -B build -G Ninja
 cmake --build build
+sudo ./build/usbip-libusb-server 3240
 ```
 
-## Run
-
-```bash
-sudo ./build/usbip-libusb-server 3240 1
-```
-
-Log level:
-
-```text
-0 = error only
-1 = info, default
-2 = trace, per-URB / per-bulk logs
-```
-
-## Client test
+Client:
 
 ```bash
 sudo modprobe vhci-hcd
-usbip list -r 127.0.0.1
-sudo usbip attach -r 127.0.0.1 -b <busid>
-lsblk
+usbip list -r <server-ip>
+sudo usbip attach -r <server-ip> -b <busid>
 ```
-
-Detach:
-
-```bash
-sudo usbip port
-sudo usbip detach -p <port>
-```
-
-## Notes
-
-This is an MVP/prototype. It intentionally focuses on Mass Storage BOT and synchronous libusb transfers.

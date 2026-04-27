@@ -3,6 +3,7 @@
 #include "LibusbBackend.h"
 #include "Log.h"
 #include "NetUtil.h"
+#include "PlatformUsb.h"
 #include "TransferManager.h"
 #include "UsbIpProtocol.h"
 
@@ -11,8 +12,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cerrno>
-#include <cstring>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -168,9 +167,7 @@ void handle_client(int client_fd, libusb_context* usb_ctx) {
         urb_loop(client_fd, handle, *rt);
 
         libusb_release_interface(handle, rt->interfaceNumber);
-#ifdef __linux__
-        libusb_attach_kernel_driver(handle, rt->interfaceNumber);
-#endif
+        platform_usb::attach_kernel_driver(handle, rt->interfaceNumber);
         libusb_close(handle);
         busy_guard.release();
         LOGI("import session ended, device released busid=" << req_busid);

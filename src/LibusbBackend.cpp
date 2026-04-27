@@ -2,9 +2,8 @@
 #include "LibusbBackend.h"
 #include "Log.h"
 #include "NetUtil.h"
+#include "PlatformUsb.h"
 
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 
 uint32_t convert_speed(int speed) {
@@ -25,62 +24,6 @@ uint32_t convert_speed(int speed) {
 }
 
 namespace {
-
-std::string read_sysfs_value(const std::filesystem::path& path) {
-    std::ifstream file(path);
-    std::string value;
-    file >> value;
-    return value;
-}
-
-std::string fallback_busid(uint8_t busnum, uint8_t devnum) {
-    return std::to_string(static_cast<unsigned>(busnum)) + "-" +
-           std::to_string(static_cast<unsigned>(devnum));
-}
-
-std::string find_linux_sysfs_busid(uint8_t busnum, uint8_t devnum) {
-#ifdef __linux__
-    const std::filesystem::path base = "/sys/bus/usb/devices";
-
-    std::error_code ec;
-    if (!std::filesystem::exists(base, ec)) {
-        return fallback_busid(busnum, devnum);
-    }
-
-    for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
-        if (ec || !entry.is_directory()) {
-            continue;
-        }
-
-        const std::string name = entry.path().filename().string();
-
-        // Skip root hubs and interface nodes. We only want device nodes such as 6-1.3.
-        if (name.rfind("usb", 0) == 0 || name.find(':') != std::string::npos) {
-            continue;
-        }
-
-        const auto busnumPath = entry.path() / "busnum";
-        const auto devnumPath = entry.path() / "devnum";
-
-        if (!std::filesystem::exists(busnumPath, ec) || !std::filesystem::exists(devnumPath, ec)) {
-            continue;
-        }
-
-        try {
-            int sysBus = std::stoi(read_sysfs_value(busnumPath));
-            int sysDev = std::stoi(read_sysfs_value(devnumPath));
-
-            if (sysBus == static_cast<int>(busnum) && sysDev == static_cast<int>(devnum)) {
-                return name;
-            }
-        } catch (const std::exception&) {
-            continue;
-        }
-    }
-#endif
-
-    return fallback_busid(busnum, devnum);
-}
 
 bool append_mass_storage_device_info(libusb_device* dev, UsbDeviceInfo& info) {
     libusb_device_descriptor dd{};
@@ -141,13 +84,8 @@ bool append_mass_storage_device_info(libusb_device* dev, UsbDeviceInfo& info) {
     info.configValue = cfg->bConfigurationValue;
     info.interfaces = std::move(ifaces);
 
-    info.busid = find_linux_sysfs_busid(static_cast<uint8_t>(info.busnum),
-                                        static_cast<uint8_t>(info.devnum));
-#ifdef __linux__
-    info.path = "/sys/bus/usb/devices/" + info.busid;
-#else
-    info.path = "/usbip-libusb/" + info.busid;
-#endif
+    info.busid = platform_usb::busid_for_device(dev);
+    info.path = platform_usb::device_path_for_busid(info.busid, dev);
 
     libusb_free_config_descriptor(cfg);
     return true;
@@ -198,9 +136,7 @@ libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::strin
 
     for (ssize_t i = 0; i < count; ++i) {
         libusb_device* dev = list[i];
-        uint8_t busnum = libusb_get_bus_number(dev);
-        uint8_t devnum = libusb_get_device_address(dev);
-        std::string cur = find_linux_sysfs_busid(busnum, devnum);
+        std::string cur = platform_usb::busid_for_device(dev);
 
         if (cur != busid) {
             continue;
@@ -289,16 +225,9 @@ std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* ha
 }
 
 bool claim_interface(libusb_device_handle* handle, int interfaceNumber) {
-#ifdef __linux__
-    if (libusb_kernel_driver_active(handle, interfaceNumber) == 1) {
-        int rc = libusb_detach_kernel_driver(handle, interfaceNumber);
-        if (rc != 0) {
-            LOGE("libusb_detach_kernel_driver failed: " << libusb_error_name(rc));
-            return false;
-        }
-        LOGI("kernel driver detached from interface " << interfaceNumber);
+    if (!platform_usb::detach_kernel_driver(handle, interfaceNumber)) {
+        return false;
     }
-#endif
 
     int rc = libusb_claim_interface(handle, interfaceNumber);
     if (rc != 0) {
@@ -337,14 +266,9 @@ bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo
 
     rt = *newRt;
 
-#ifdef __linux__
-    if (libusb_kernel_driver_active(handle, rt.interfaceNumber) == 1) {
-        int drc = libusb_detach_kernel_driver(handle, rt.interfaceNumber);
-        if (drc != 0) {
-            LOGE("detach after set-config failed: " << libusb_error_name(drc));
-        }
+    if (!platform_usb::detach_kernel_driver(handle, rt.interfaceNumber)) {
+        return false;
     }
-#endif
 
     int rc = libusb_claim_interface(handle, rt.interfaceNumber);
     if (rc != 0) {
@@ -485,8 +409,9 @@ int handle_bulk_submit(libusb_device_handle* handle, const UsbRuntimeInfo& rt, c
 
     if (rc < 0) {
         /*
-         * 可恢复 PIPE：不要先 LOGE。
-         * 先 clear halt + retry，retry 成功就静默返回。
+         * Recoverable PIPE error: do not log as an error immediately.
+         * First attempt to clear the halt condition and retry.
+         * If the retry succeeds, return silently.
          */
         if (rc == LIBUSB_ERROR_PIPE) {
             LOGT("bulk endpoint stalled, clear halt and retry once:"
@@ -523,7 +448,7 @@ int handle_bulk_submit(libusb_device_handle* handle, const UsbRuntimeInfo& rt, c
         }
 
         /*
-         * NO_DEVICE：热拔，不算程序错误。
+         * NO_DEVICE indicates hot unplug and is not a program error.
          */
         if (rc == LIBUSB_ERROR_NO_DEVICE) {
             ++g_stats.bulkError;
@@ -536,7 +461,7 @@ int handle_bulk_submit(libusb_device_handle* handle, const UsbRuntimeInfo& rt, c
         }
 
         /*
-         * TIMEOUT：才做 BOT reset recovery。
+         * Only TIMEOUT triggers BOT reset recovery.
          */
         if (rc == LIBUSB_ERROR_TIMEOUT) {
             ++g_stats.bulkError;
@@ -550,7 +475,7 @@ int handle_bulk_submit(libusb_device_handle* handle, const UsbRuntimeInfo& rt, c
         }
 
         /*
-         * 其他才是真 ERROR。
+         * Others are true ERROR。
          */
         ++g_stats.bulkError;
 
