@@ -5,7 +5,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-// #include <array>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -18,6 +18,26 @@ static constexpr uint16_t OP_REQ_DEVLIST = 0x8005;
 static constexpr uint16_t OP_REP_DEVLIST = 0x0005;
 static constexpr uint16_t OP_REQ_IMPORT = 0x8003;
 static constexpr uint16_t OP_REP_IMPORT = 0x0003;
+
+static constexpr uint32_t USBIP_CMD_SUBMIT = 0x00000001;
+static constexpr uint32_t USBIP_CMD_UNLINK = 0x00000002;
+static constexpr uint32_t USBIP_RET_SUBMIT = 0x00000003;
+static constexpr uint32_t USBIP_RET_UNLINK = 0x00000004;
+
+static constexpr uint32_t USBIP_DIR_OUT = 0;
+static constexpr uint32_t USBIP_DIR_IN = 1;
+
+static uint32_t get_be32(const uint8_t *p)
+{
+    uint32_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return ntohl(v);
+}
+
+static int32_t get_be32s(const uint8_t *p)
+{
+    return static_cast<int32_t>(get_be32(p));
+}
 
 static bool read_exact(int fd, void *buf, size_t len)
 {
@@ -116,6 +136,161 @@ static uint32_t convert_speed(int speed)
     default:
         return 0;
     }
+}
+
+struct UrbSubmit
+{
+    uint32_t seqnum = 0;
+    uint32_t devid = 0;
+    uint32_t direction = 0;
+    uint32_t ep = 0;
+
+    uint32_t transfer_flags = 0;
+    uint32_t transfer_buffer_length = 0;
+    uint32_t start_frame = 0;
+    uint32_t number_of_packets = 0;
+    uint32_t interval = 0;
+
+    std::array<uint8_t, 8> setup{};
+    std::vector<uint8_t> out_payload;
+};
+
+static bool send_ret_submit(
+    int client_fd,
+    uint32_t seqnum,
+    int32_t status,
+    const std::vector<uint8_t> &in_payload)
+{
+    std::vector<uint8_t> out;
+
+    put_u32(out, USBIP_RET_SUBMIT);
+    put_u32(out, seqnum);
+    put_u32(out, 0); // devid, server response shall be 0
+    put_u32(out, 0); // direction, server response shall be 0
+    put_u32(out, 0); // ep, server response shall be 0
+
+    put_u32(out, static_cast<uint32_t>(status));
+    put_u32(out, static_cast<uint32_t>(in_payload.size()));
+    put_u32(out, 0);          // start_frame
+    put_u32(out, 0xffffffff); // number_of_packets, non-ISO
+    put_u32(out, 0);          // error_count
+
+    for (int i = 0; i < 8; ++i) {
+        put_u8(out, 0); // padding
+    }
+
+    out.insert(out.end(), in_payload.begin(), in_payload.end());
+
+    return write_exact(client_fd, out.data(), out.size());
+}
+
+static bool parse_submit(
+    int client_fd,
+    const uint8_t header[48],
+    UrbSubmit &urb)
+{
+    urb.seqnum = get_be32(header + 4);
+    urb.devid = get_be32(header + 8);
+    urb.direction = get_be32(header + 12);
+    urb.ep = get_be32(header + 16);
+
+    urb.transfer_flags = get_be32(header + 20);
+    urb.transfer_buffer_length = get_be32(header + 24);
+    urb.start_frame = get_be32(header + 28);
+    urb.number_of_packets = get_be32(header + 32);
+    urb.interval = get_be32(header + 36);
+
+    std::memcpy(urb.setup.data(), header + 40, 8);
+
+    if (urb.direction == USBIP_DIR_OUT && urb.transfer_buffer_length > 0) {
+        urb.out_payload.resize(urb.transfer_buffer_length);
+        if (!read_exact(client_fd, urb.out_payload.data(), urb.out_payload.size())) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int handle_control_submit(
+    libusb_device_handle *handle,
+    const UrbSubmit &urb,
+    std::vector<uint8_t> &response)
+{
+    uint8_t bmRequestType = urb.setup[0];
+    uint8_t bRequest = urb.setup[1];
+
+    uint16_t wValue = static_cast<uint16_t>(urb.setup[2] | (urb.setup[3] << 8));
+    uint16_t wIndex = static_cast<uint16_t>(urb.setup[4] | (urb.setup[5] << 8));
+    uint16_t wLength = static_cast<uint16_t>(urb.setup[6] | (urb.setup[7] << 8));
+
+    std::vector<uint8_t> buffer;
+
+    if ((bmRequestType & 0x80) != 0) {
+        buffer.resize(wLength);
+    } else {
+        buffer = urb.out_payload;
+    }
+
+    int rc = libusb_control_transfer(
+        handle,
+        bmRequestType,
+        bRequest,
+        wValue,
+        wIndex,
+        buffer.data(),
+        static_cast<uint16_t>(buffer.size()),
+        5000);
+
+    std::cout << "control:"
+              << " bm=0x" << std::hex << static_cast<int>(bmRequestType)
+              << " req=0x" << static_cast<int>(bRequest)
+              << " value=0x" << wValue
+              << " index=0x" << wIndex
+              << " len=" << std::dec << wLength
+              << " rc=" << rc
+              << std::endl;
+
+    if (rc < 0) {
+        return rc;
+    }
+
+    if ((bmRequestType & 0x80) != 0) {
+        response.assign(buffer.begin(), buffer.begin() + rc);
+    }
+
+    return 0;
+}
+
+static libusb_device_handle *open_device_by_busid(
+    libusb_context *ctx,
+    const std::string &busid)
+{
+    libusb_device **list = nullptr;
+    ssize_t count = libusb_get_device_list(ctx, &list);
+    if (count < 0)
+        return nullptr;
+
+    libusb_device_handle *handle = nullptr;
+
+    for (ssize_t i = 0; i < count; ++i) {
+        libusb_device *dev = list[i];
+
+        uint8_t busnum = libusb_get_bus_number(dev);
+        uint8_t devnum = libusb_get_device_address(dev);
+
+        std::string cur = std::to_string(busnum) + "-" + std::to_string(devnum);
+        if (cur != busid)
+            continue;
+
+        if (libusb_open(dev, &handle) != 0) {
+            handle = nullptr;
+        }
+        break;
+    }
+
+    libusb_free_device_list(list, 1);
+    return handle;
 }
 
 static std::optional<UsbDeviceInfo> find_mass_storage_device(libusb_context *ctx)
@@ -277,9 +452,9 @@ static std::string trim_c_string(const char *data, size_t len)
     return std::string(data, n);
 }
 
-static void urb_loop_placeholder(int client_fd)
+static void urb_loop(int client_fd, libusb_device_handle *handle)
 {
-    std::cout << "enter URB loop placeholder" << std::endl;
+    std::cout << "enter URB loop" << std::endl;
 
     while (true) {
         uint8_t header[48];
@@ -289,19 +464,51 @@ static void urb_loop_placeholder(int client_fd)
             return;
         }
 
-        uint32_t command = ntohl(*reinterpret_cast<uint32_t *>(header + 0));
-        uint32_t seqnum = ntohl(*reinterpret_cast<uint32_t *>(header + 4));
-        uint32_t devid = ntohl(*reinterpret_cast<uint32_t *>(header + 8));
-        uint32_t direction = ntohl(*reinterpret_cast<uint32_t *>(header + 12));
-        uint32_t ep = ntohl(*reinterpret_cast<uint32_t *>(header + 16));
+        uint32_t command = get_be32(header + 0);
 
-        std::cout << "URB packet:"
-                  << " command=0x" << std::hex << command
-                  << " seqnum=" << std::dec << seqnum
-                  << " devid=" << devid
-                  << " direction=" << direction
-                  << " ep=" << ep
-                  << std::endl;
+        if (command == USBIP_CMD_SUBMIT) {
+            UrbSubmit urb;
+            if (!parse_submit(client_fd, header, urb)) {
+                std::cerr << "failed to parse submit" << std::endl;
+                return;
+            }
+
+            std::cout << "SUBMIT:"
+                      << " seq=" << urb.seqnum
+                      << " dir=" << urb.direction
+                      << " ep=" << urb.ep
+                      << " len=" << urb.transfer_buffer_length
+                      << std::endl;
+
+            std::vector<uint8_t> response;
+
+            if (urb.ep == 0) {
+                int rc = handle_control_submit(handle, urb, response);
+
+                if (rc < 0) {
+                    send_ret_submit(client_fd, urb.seqnum, rc, {});
+                } else {
+                    send_ret_submit(client_fd, urb.seqnum, 0, response);
+                }
+            } else {
+                std::cerr << "non-control endpoint not implemented yet: ep="
+                          << urb.ep << std::endl;
+
+                send_ret_submit(client_fd, urb.seqnum, -32, {});
+            }
+
+            continue;
+        }
+
+        if (command == USBIP_CMD_UNLINK) {
+            std::cerr << "UNLINK not implemented yet" << std::endl;
+            return;
+        }
+
+        std::cerr << "unknown URB command=0x"
+                  << std::hex << command
+                  << std::dec << std::endl;
+        return;
     }
 }
 
@@ -373,7 +580,17 @@ static void handle_client(int client_fd, libusb_context *usb_ctx)
         }
 
         std::cout << "import ok, keep connection for URB traffic" << std::endl;
-        urb_loop_placeholder(client_fd);
+        libusb_device_handle *handle = open_device_by_busid(usb_ctx, dev->busid);
+        if (!handle) {
+            std::cerr << "failed to open libusb device" << std::endl;
+            return;
+        }
+
+        std::cout << "libusb open ok" << std::endl;
+
+        urb_loop(client_fd, handle);
+
+        libusb_close(handle);
         return;
     }
 
