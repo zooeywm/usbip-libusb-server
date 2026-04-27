@@ -11,8 +11,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cerrno>
-#include <cstring>
 #include <iostream>
 #include <string>
 

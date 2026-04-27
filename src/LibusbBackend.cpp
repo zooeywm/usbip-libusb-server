@@ -4,22 +4,28 @@
 #include "Log.h"
 #include "NetUtil.h"
 
-#include <algorithm>
-#include <cstring>
 #include <iostream>
 
-uint32_t convert_speed(int speed) {
+uint32_t convert_speed(int speed)
+{
     switch (speed) {
-    case LIBUSB_SPEED_LOW: return 1;
-    case LIBUSB_SPEED_FULL: return 2;
-    case LIBUSB_SPEED_HIGH: return 3;
-    case LIBUSB_SPEED_SUPER: return 5;
-    case LIBUSB_SPEED_SUPER_PLUS: return 6;
-    default: return 0;
+    case LIBUSB_SPEED_LOW:
+        return 1;
+    case LIBUSB_SPEED_FULL:
+        return 2;
+    case LIBUSB_SPEED_HIGH:
+        return 3;
+    case LIBUSB_SPEED_SUPER:
+        return 5;
+    case LIBUSB_SPEED_SUPER_PLUS:
+        return 6;
+    default:
+        return 0;
     }
 }
 
-std::optional<UsbDeviceInfo> find_mass_storage_device(libusb_context* ctx) {
+std::optional<UsbDeviceInfo> find_mass_storage_device(libusb_context* ctx)
+{
     libusb_device** list = nullptr;
     ssize_t count = libusb_get_device_list(ctx, &list);
     if (count < 0) {
@@ -97,7 +103,8 @@ std::optional<UsbDeviceInfo> find_mass_storage_device(libusb_context* ctx) {
     return result;
 }
 
-libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::string& busid) {
+libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::string& busid)
+{
     libusb_device** list = nullptr;
     ssize_t count = libusb_get_device_list(ctx, &list);
     if (count < 0) {
@@ -126,7 +133,8 @@ libusb_device_handle* open_device_by_busid(libusb_context* ctx, const std::strin
     return handle;
 }
 
-std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* handle) {
+std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* handle)
+{
     libusb_device* dev = libusb_get_device(handle);
 
     libusb_config_descriptor* cfg = nullptr;
@@ -196,7 +204,8 @@ std::optional<UsbRuntimeInfo> find_mass_storage_runtime(libusb_device_handle* ha
     return bot ? bot : fallback;
 }
 
-bool claim_interface(libusb_device_handle* handle, int interfaceNumber) {
+bool claim_interface(libusb_device_handle* handle, int interfaceNumber)
+{
 #ifdef __linux__
     if (libusb_kernel_driver_active(handle, interfaceNumber) == 1) {
         int rc = libusb_detach_kernel_driver(handle, interfaceNumber);
@@ -218,7 +227,8 @@ bool claim_interface(libusb_device_handle* handle, int interfaceNumber) {
     return true;
 }
 
-bool select_alt_setting(libusb_device_handle* handle, const UsbRuntimeInfo& rt) {
+bool select_alt_setting(libusb_device_handle* handle, const UsbRuntimeInfo& rt)
+{
     int rc = libusb_set_interface_alt_setting(handle, rt.interfaceNumber, rt.altSetting);
     if (rc != 0) {
         LOGE("libusb_set_interface_alt_setting failed: "
@@ -236,7 +246,8 @@ bool select_alt_setting(libusb_device_handle* handle, const UsbRuntimeInfo& rt) 
     return true;
 }
 
-bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo& rt) {
+bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo& rt)
+{
     if (rt.interfaceNumber >= 0) {
         libusb_release_interface(handle, rt.interfaceNumber);
     }
@@ -272,14 +283,15 @@ bool reclaim_mass_storage_interface(libusb_device_handle* handle, UsbRuntimeInfo
     libusb_clear_halt(handle, rt.bulkOutEp);
 
     LOGI("reclaimed interface=" << rt.interfaceNumber
-         << " bulkIn=0x" << std::hex << static_cast<int>(rt.bulkInEp)
-         << " bulkOut=0x" << static_cast<int>(rt.bulkOutEp)
-         << std::dec);
+                                << " bulkIn=0x" << std::hex << static_cast<int>(rt.bulkInEp)
+                                << " bulkOut=0x" << static_cast<int>(rt.bulkOutEp)
+                                << std::dec);
 
     return true;
 }
 
-void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt, const char* reason) {
+void bot_reset_recovery(libusb_device_handle* handle, const UsbRuntimeInfo& rt, const char* reason)
+{
     auto n = ++g_stats.botRecovery;
 
     LOGW("BOT reset recovery count=" << n << " reason=" << reason);
@@ -321,9 +333,9 @@ int handle_control_submit(
         auto n = ++g_stats.req031;
 
         LOGW("0x31 reset-like request count=" << n
-             << " value=0x" << std::hex << wValue
-             << " index=0x" << wIndex
-             << std::dec);
+                                              << " value=0x" << std::hex << wValue
+                                              << " index=0x" << wIndex
+                                              << std::dec);
 
         if ((n % 50) == 0) {
             dump_stats("0x31");
@@ -423,6 +435,48 @@ int handle_bulk_submit(
     int rc = libusb_bulk_transfer(handle, endpoint, data, length, &transferred, 15000);
 
     if (rc < 0) {
+        /*
+     * BOT CSW 是 13 字节 IN。
+     * 部分 U 盘会在 CSW 阶段 STALL bulk-in。
+     * 这里属于可恢复路径：clear halt 后重读 CSW。
+     */
+        if (rc == LIBUSB_ERROR_PIPE && urb.direction == usbip::DirIn && length == 13) {
+            static uint64_t cswPipeRecovered = 0;
+
+            libusb_clear_halt(handle, endpoint);
+
+            transferred = 0;
+            rc = libusb_bulk_transfer(
+                handle,
+                endpoint,
+                data,
+                length,
+                &transferred,
+                15000);
+
+            if (rc == 0) {
+                ++cswPipeRecovered;
+
+                if ((cswPipeRecovered % 100) == 0) {
+                    LOGW("CSW pipe recovered count=" << cswPipeRecovered);
+                }
+
+                response.resize(transferred);
+                return 0;
+            }
+
+            ++g_stats.bulkError;
+
+            LOGE("CSW retry failed:"
+                 << " ep=0x" << std::hex << static_cast<int>(endpoint)
+                 << " rc=" << std::dec << rc
+                 << " " << libusb_error_name(rc)
+                 << " transferred=" << transferred);
+
+            response.clear();
+            return rc;
+        }
+
         ++g_stats.bulkError;
 
         LOGE("bulk failed:"
@@ -432,14 +486,42 @@ int handle_bulk_submit(
              << " dir=" << urb.direction
              << " len=" << length);
 
-        if (rc == LIBUSB_ERROR_PIPE || rc == LIBUSB_ERROR_TIMEOUT) {
+        if (rc == LIBUSB_ERROR_PIPE) {
+            LOGW("bulk endpoint stalled, clear halt and retry once");
+
+            libusb_clear_halt(handle, endpoint);
+
+            transferred = 0;
+            rc = libusb_bulk_transfer(
+                handle,
+                endpoint,
+                data,
+                length,
+                &transferred,
+                15000);
+
+            LOGW("bulk retry:"
+                 << " rc=" << rc
+                 << " " << libusb_error_name(rc)
+                 << " transferred=" << transferred);
+
+            if (rc == 0) {
+                if (urb.direction == usbip::DirIn) {
+                    response.resize(transferred);
+                }
+                return 0;
+            }
+
+            response.clear();
+            return rc;
+        }
+
+        if (rc == LIBUSB_ERROR_TIMEOUT) {
             bot_reset_recovery(handle, rt, libusb_error_name(rc));
             response.clear();
             return rc;
         }
 
-        libusb_clear_halt(handle, rt.bulkInEp);
-        libusb_clear_halt(handle, rt.bulkOutEp);
         response.clear();
         return rc;
     }
